@@ -4,11 +4,13 @@ A Windows-friendly Python dashboard for the Kmart Anko iDotMatrix display. It co
 
 ## Install
 
-From the repository root in PowerShell:
+From the repository root in PowerShell (see the root README for the full setup):
 
 ```powershell
-$py = ".\python3-idotmatrix-client-main\venv_windows\Scripts\python.exe"
-& $py -m pip install -r .\dashboard\requirements.txt
+py -3 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r .\dashboard\requirements.txt
+.\.venv\Scripts\python.exe -m pip install -e .\python3-idotmatrix-client-main
+Copy-Item .\dashboard\config.example.json .\dashboard\config.json
 ```
 
 This installs Pillow for the images, `gtfs-realtime-bindings` to decode Translink's GTFS-Realtime protobuf feed, and `tzdata` because Windows Python does not always ship the IANA time-zone database used for the Brisbane noon switch. The static timetable ZIP is downloaded on first run and cached at `dashboard\cache\SEQ_GTFS.zip` for 14 days. A network connection is needed to obtain the timetable and live predictions. No API key is required.
@@ -58,4 +60,4 @@ Forecast and location lookup use the [Open-Meteo Forecast API](https://open-mete
 
 ## Transit data and attribution
 
-Static South East Queensland GTFS timetables and the bus GTFS-Realtime TripUpdates feed are supplied by [Translink Open Data](https://translink.com.au/about-translink/open-data). The official feed documentation identifies GTFS-Realtime v2; the public endpoint used here does not require an API key. Data is provided under [Creative Commons Attribution 4.0](https://creativecommons.org/licenses/by/4.0/). Keep this attribution with the project and follow Translink's [open-data terms](https://translink.com.au/about-translink/open-data/terms-and-conditions), including its requirement to provide and keep contact details current when using the data. This POC only looks up route 150 at the two configured stops.
+Static South East Queensland GTFS timetables and the bus GTFS-Realtime TripUpdates feed are supplied by [Translink Open Data](https://translink.com.au/about-translink/open-data). The official feed documentation identifies GTFS-Realtime v2; the public endpoint used here does not require an API key. Data is provided under [Creative Commons Attribution 4.0](https://creativecommons.org/licenses/by/4.0/). Keep this attribution with the project and follow Translink's [open-data terms](https://translink.com.au/about-translink/open-data/terms-and-conditions), including its requirement to provide and keep contact details current when using the data. This POC looks up the route numbers configured in `config.json` at the two configured stops.
