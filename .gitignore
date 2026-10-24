@@ -1,0 +1,20 @@
+# Local configuration contains device-specific details.
+/dashboard/config.json
+
+# Downloaded data and generated display previews.
+/dashboard/cache/
+/dashboard/output/
+
+# Local Python environments and build artifacts.
+**/.venv/
+**/venv/
+**/venv_windows/
+**/__pycache__/
+**/*.py[cod]
+**/*.egg-info/
+/build/
+/dist/
+*.log
+
+# Handover notes may contain personal/device details; use the public README instead.
+/PROJECT_BRIEF.md
