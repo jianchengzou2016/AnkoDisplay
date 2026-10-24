@@ -8,6 +8,7 @@ import logging
 import subprocess
 import sys
 import time
+from datetime import datetime, time as clock_time
 from pathlib import Path
 
 from bus import BusArrival, BusDataError, TranslinkBusClient, sample_arrival
@@ -20,6 +21,7 @@ PROJECT_ROOT = ROOT.parent
 DEFAULT_CONFIG = ROOT / "config.json"
 LOG = logging.getLogger("ankodashboard")
 WEATHER_CONDITIONS = ("sunny", "cloudy", "rain", "thunderstorm")
+WEEKDAYS = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
 
 
 def load_config(path: Path) -> dict:
@@ -50,10 +52,63 @@ def load_config(path: Path) -> dict:
         raise ValueError("bus_routes must be a non-empty list of route numbers")
     if int(config.get("bus_alternate_window_minutes", 60)) < 1:
         raise ValueError("bus_alternate_window_minutes must be at least 1")
+    active_hours = config.get("active_hours", {"enabled": False})
+    if not isinstance(active_hours, dict):
+        raise ValueError("active_hours must be an object")
+    if not isinstance(active_hours.get("enabled", False), bool):
+        raise ValueError("active_hours.enabled must be true or false")
+    if active_hours.get("enabled", False):
+        windows = active_hours.get("windows")
+        if not isinstance(windows, list) or not windows:
+            raise ValueError("active_hours.windows must be a non-empty list when active hours are enabled")
+        for index, window in enumerate(windows):
+            if not isinstance(window, dict):
+                raise ValueError(f"active_hours.windows[{index}] must be an object")
+            for field in ("start", "end"):
+                value = window.get(field)
+                try:
+                    parsed = datetime.strptime(value, "%H:%M").time()
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"active_hours.windows[{index}].{field} must use HH:MM (24-hour) format") from exc
+                if parsed.strftime("%H:%M") != value:
+                    raise ValueError(f"active_hours.windows[{index}].{field} must use zero-padded HH:MM format")
+            days = window.get("days", list(WEEKDAYS))
+            if not isinstance(days, list) or not days or any(day not in WEEKDAYS for day in days):
+                raise ValueError(
+                    f"active_hours.windows[{index}].days must be a non-empty list of mon, tue, wed, thu, fri, sat, sun"
+                )
+            if window["start"] == window["end"]:
+                raise ValueError(f"active_hours.windows[{index}] start and end must differ")
     return config
 
 
-def upload_image(image_path: Path, config: dict, content_description: str) -> None:
+def _active_windows(config: dict) -> list[tuple[clock_time, clock_time, frozenset[int]]]:
+    schedule = config.get("active_hours", {})
+    return [
+        (
+            datetime.strptime(window["start"], "%H:%M").time(),
+            datetime.strptime(window["end"], "%H:%M").time(),
+            frozenset(WEEKDAYS[day] for day in window.get("days", WEEKDAYS)),
+        )
+        for window in schedule.get("windows", [])
+    ]
+
+
+def _is_in_active_hours(now: datetime, windows: list[tuple[clock_time, clock_time, frozenset[int]]]) -> bool:
+    local_time = now.time().replace(tzinfo=None)
+    weekday = now.weekday()
+    for start, end, days in windows:
+        if start < end:
+            if weekday in days and start <= local_time < end:
+                return True
+        elif (weekday in days and local_time >= start) or (
+            (weekday - 1) % 7 in days and local_time < end
+        ):
+            return True
+    return False
+
+
+def _client_command(config: dict, *arguments: str) -> tuple[list[str], Path]:
     client_dir = Path(config["client_directory"])
     if not client_dir.is_absolute():
         client_dir = (PROJECT_ROOT / client_dir).resolve()
@@ -64,14 +119,24 @@ def upload_image(image_path: Path, config: dict, content_description: str) -> No
     configured_python = Path(str(config.get("client_python", "python")))
     if not configured_python.is_absolute() and ("/" in str(configured_python) or "\\" in str(configured_python)):
         configured_python = (PROJECT_ROOT / configured_python).resolve()
-    command = [
-        str(configured_python), str(client_app), "--address", str(config["display_address"]),
-        "--image", "true", "--set-image", str(image_path.resolve()),
-    ]
+    command = [str(configured_python), str(client_app), "--address", str(config["display_address"]), *arguments]
+    return command, client_dir
+
+
+def upload_image(image_path: Path, config: dict, content_description: str) -> None:
+    command, client_dir = _client_command(
+        config, "--image", "true", "--set-image", str(image_path.resolve())
+    )
     LOG.info(
         "Uploading to display %s: %s (image=%s)",
         config["display_address"], content_description, image_path.name,
     )
+    subprocess.run(command, cwd=client_dir, check=True)
+
+
+def set_display_screen(config: dict, state: str) -> None:
+    command, client_dir = _client_command(config, "--screen", state)
+    LOG.info("Turning display screen %s", state)
     subprocess.run(command, cwd=client_dir, check=True)
 
 
@@ -151,6 +216,7 @@ def main() -> int:
     args = parse_args()
     try:
         config = load_config(args.config)
+        schedule_enabled = bool(config.get("active_hours", {}).get("enabled", False))
         if args.sample:
             path = _weather_image(args.sample)
             LOG.info("Saved offline weather sample %s", path)
@@ -159,6 +225,10 @@ def main() -> int:
             path = _bus_image(sample_arrival())
             LOG.info("Saved offline bus sample %s", path)
             return 0
+        if schedule_enabled and not args.upload:
+            LOG.warning("Active-hours display control requires --upload; schedule is ignored")
+            schedule_enabled = False
+        active_windows = _active_windows(config) if schedule_enabled else []
 
         bus_client: TranslinkBusClient | None = None
         last_bus_image: Path | None = None
@@ -171,9 +241,45 @@ def main() -> int:
         started = time.monotonic()
         next_bus_update = 0.0
         next_weather_update = 0.0
+        schedule_was_active = False
+        display_is_on = False
+        last_screen_attempt = 0.0
+        waiting_logged = False
 
         while True:
             now = time.monotonic()
+            if schedule_enabled:
+                active_now = _is_in_active_hours(datetime.now().astimezone(), active_windows)
+                if not active_now:
+                    if schedule_was_active:
+                        LOG.info("Active hours ended; turning the display off and stopping")
+                        try:
+                            set_display_screen(config, "off")
+                        except (OSError, subprocess.SubprocessError, ValueError) as exc:
+                            LOG.error("Could not turn the display off: %s", exc)
+                        return 0
+                    if not waiting_logged:
+                        LOG.info("Outside active hours; waiting for the next configured window")
+                        waiting_logged = True
+                    if args.once:
+                        return 0
+                    time.sleep(max(0.5, float(config.get("loop_sleep_seconds", 1))))
+                    continue
+
+                if not schedule_was_active:
+                    LOG.info("Active hours started; turning the display on before content updates")
+                    schedule_was_active = True
+                    displayed_signature = None
+                    waiting_logged = False
+                if not display_is_on and now - last_screen_attempt >= 15:
+                    last_screen_attempt = now
+                    try:
+                        set_display_screen(config, "on")
+                        display_is_on = True
+                        displayed_signature = None
+                    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+                        LOG.error("Could not turn the display on; will retry: %s", exc)
+
             if now >= next_bus_update:
                 try:
                     if bus_client is None:
@@ -227,7 +333,8 @@ def main() -> int:
                 desired_image = last_bus_image
                 signature = ("bus", last_bus_signature)
 
-            if (args.upload and desired_image is not None and signature != displayed_signature
+            if (args.upload and (not schedule_enabled or display_is_on)
+                    and desired_image is not None and signature != displayed_signature
                     and now - last_upload_attempt >= 15):
                 last_upload_attempt = now
                 try:

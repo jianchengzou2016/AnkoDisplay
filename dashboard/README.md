@@ -54,6 +54,24 @@ $py = ".\python3-idotmatrix-client-main\venv_windows\Scripts\python.exe"
 
 The app uploads only when the visible page changes. Press Ctrl+C to stop. Keep the Anko phone app disconnected while the PC is controlling the display. The existing iDotMatrix client and its command-line interface are configured with `client_directory`, `client_python`, and `display_address` in `config.json`.
 
+## Active hours POC
+
+Active-hour control is opt-in. In `config.json`, set `active_hours.enabled` to `true` and configure one or more local-time windows:
+
+```json
+"active_hours": {
+  "enabled": true,
+  "windows": [
+    { "start": "06:30", "end": "08:30", "days": ["mon", "tue", "wed", "thu", "fri"] },
+    { "start": "15:00", "end": "22:00" }
+  ]
+}
+```
+
+Times use the Windows PC's local time and 24-hour `HH:MM` format. `days` is optional and defaults to every day; supported values are `mon` through `sun`. Overnight windows are supported. Start is inclusive and end is exclusive. Run the normal `--upload` command: outside a window it waits without uploading; at the start it sends screen-on before any image; at the end it sends screen-off and exits. Configure Task Scheduler to start the app before a window if the PC will be asleep; the app waits until the window actually starts before waking the display. `--once` exits immediately if started outside active hours.
+
+For a manual Windows Task Scheduler POC, create one task for each active-window start, scheduled two minutes early, with **Wake the computer to run this task** enabled and an action that starts the configured Python executable with `dashboard\app.py --upload` as arguments (set the repository root as the working directory). Windows power settings, firmware and the Bluetooth adapter must support wake/resume for this to work. The dashboard does not create Windows tasks or put the PC to sleep. At each window end it turns off the display and exits; you can add a separate delayed standby task after confirming the Wyse's sleep/wake behavior manually. Keep such a task disabled until wake and Bluetooth reconnect have been verified.
+
 ## Weather data
 
 Forecast and location lookup use the [Open-Meteo Forecast API](https://open-meteo.com/en/docs) and [Geocoding API](https://open-meteo.com/en/docs/geocoding-api). The free endpoints require no key for non-commercial use. Review Open-Meteo's [usage terms](https://open-meteo.com/en/terms). The current “umbrella likely” starter rule uses rain/drizzle forecast codes or a precipitation probability of at least 50% over the next two hours. Both values can be changed in `config.json`.

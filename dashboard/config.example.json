@@ -26,5 +26,11 @@
   "bus_download_timeout_seconds": 90,
   "loop_sleep_seconds": 1,
   "forecast_window_hours": 2,
-  "rain_probability_threshold": 50
+  "rain_probability_threshold": 50,
+  "active_hours": {
+    "enabled": false,
+    "windows": [
+      { "start": "06:30", "end": "22:00" }
+    ]
+  }
 }
