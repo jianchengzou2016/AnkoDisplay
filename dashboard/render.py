@@ -24,6 +24,7 @@ FONT_3X5 = {
     "8": ("111", "101", "111", "101", "111"),
     "9": ("111", "101", "111", "001", "111"),
     "-": ("000", "000", "111", "000", "000"),
+    "+": ("000", "010", "111", "010", "000"),
     # A 5-pixel-wide lowercase m keeps its two arches distinct from an n.
     "m": ("00000", "11111", "10101", "10101", "10101"),
     "C": ("111", "100", "100", "100", "111"),
@@ -107,14 +108,18 @@ def render_bus_status(arrival: BusArrival, output_path: Path) -> Path:
     draw.point((15, 5), fill=status_color)
 
     eta = arrival.eta_minutes
+    gap = 1
     if eta is None:
         value = "--m"
     elif eta >= 100:
-        value = "99m"
+        # Four compact glyphs fit at 14 pixels when touching: 99+m means
+        # the ETA is at least 100 minutes, without suggesting it is exactly 99.
+        value = "99+m"
+        gap = 0
     else:
         value = f"{eta}m"
-    width = _text_width(value)
-    _draw_3x5(draw, value, max(0, (16 - width) // 2), 9, eta_color)
+    width = _text_width(value, gap=gap)
+    _draw_3x5(draw, value, max(0, (16 - width) // 2), 9, eta_color, gap=gap)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     image.save(output_path, format="PNG", optimize=True)

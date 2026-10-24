@@ -53,7 +53,7 @@ def load_config(path: Path) -> dict:
     return config
 
 
-def upload_image(image_path: Path, config: dict) -> None:
+def upload_image(image_path: Path, config: dict, content_description: str) -> None:
     client_dir = Path(config["client_directory"])
     if not client_dir.is_absolute():
         client_dir = (PROJECT_ROOT / client_dir).resolve()
@@ -68,7 +68,10 @@ def upload_image(image_path: Path, config: dict) -> None:
         str(configured_python), str(client_app), "--address", str(config["display_address"]),
         "--image", "true", "--set-image", str(image_path.resolve()),
     ]
-    LOG.info("Uploading %s to display %s", image_path.name, config["display_address"])
+    LOG.info(
+        "Uploading to display %s: %s (image=%s)",
+        config["display_address"], content_description, image_path.name,
+    )
     subprocess.run(command, cwd=client_dir, check=True)
 
 
@@ -105,6 +108,28 @@ def _bus_image(arrival: BusArrival) -> Path:
 
 def _arrival_signature(arrival: BusArrival) -> tuple:
     return arrival.route, arrival.direction, arrival.eta_minutes, arrival.source
+
+
+def _upload_content_description(signature: tuple) -> str:
+    page_type, page_data = signature
+    if page_type == "weather":
+        return f"weather icon={page_data}; source=Open-Meteo forecast"
+
+    if page_data is None:
+        return "bus page content=unavailable; source=unknown"
+
+    route, direction, eta, source = page_data
+    destination_marker = "C" if direction == "inbound" else "B"
+    eta_text = "--m" if eta is None else ("99+m" if eta >= 100 else f"{eta}m")
+    source_description = {
+        "realtime": "Translink realtime TripUpdates API prediction",
+        "scheduled": "Translink GTFS timetable",
+        "unknown": "unknown/no arrival data",
+    }.get(source, str(source))
+    return (
+        f"bus page content={route} {destination_marker} {eta_text}; "
+        f"source={source_description}"
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -206,7 +231,8 @@ def main() -> int:
                     and now - last_upload_attempt >= 15):
                 last_upload_attempt = now
                 try:
-                    upload_image(desired_image, config)
+                    content_description = _upload_content_description(signature)
+                    upload_image(desired_image, config, content_description)
                     displayed_signature = signature
                 except (OSError, subprocess.SubprocessError, ValueError) as exc:
                     LOG.error("Display upload failed: %s", exc)
