@@ -6,6 +6,10 @@
   "client_directory": "python3-idotmatrix-client-main",
   "client_python": ".venv\\Scripts\\python.exe",
   "bus_routes": ["150", "153"],
+  "realtime_route_id_prefixes": {
+    "150": ["150-"],
+    "153": ["153-"]
+  },
   "bus_inbound_stop_id": "000000",
   "bus_outbound_stop_id": "000000",
   "bus_inbound_destination": "Inbound",
@@ -25,6 +29,7 @@
   "bus_request_timeout_seconds": 12,
   "bus_download_timeout_seconds": 90,
   "loop_sleep_seconds": 1,
+  "log_level": "INFO",
   "forecast_window_hours": 2,
   "rain_probability_threshold": 50,
   "active_hours": {

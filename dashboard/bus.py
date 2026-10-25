@@ -7,6 +7,7 @@ import io
 import logging
 import time
 import zipfile
+from collections import Counter
 from dataclasses import dataclass
 from datetime import date, datetime, time as day_time, timedelta, timezone
 from pathlib import Path
@@ -53,6 +54,16 @@ class BusArrival:
             return None
         seconds = (self.arrival - datetime.now(TRANSIT_TZ)).total_seconds()
         return max(0, int((seconds + 59) // 60))
+
+
+@dataclass(frozen=True)
+class RealtimeStopPrediction:
+    route: str
+    trip_id: str
+    arrival: datetime | None
+    delay_seconds: int | None
+    start_date: str
+    start_time: str
 
 
 def _download(url: str, timeout: int = 30) -> bytes:
@@ -119,6 +130,13 @@ class TranslinkBusClient:
         if not self.route_short_names:
             raise BusDataError("At least one bus route must be configured")
         self.route_short_name = self.route_short_names[0]
+        configured_prefixes = config.get("realtime_route_id_prefixes", {})
+        self.realtime_route_id_prefixes = {
+            route: tuple(configured_prefixes.get(route, [f"{route}-"]))
+            for route in self.route_short_names
+        }
+        self.route_short_names_by_id: dict[str, str] = {}
+        self.trip_start_times: dict[str, tuple[int, int]] = {}
         self.stop_ids = {
             "inbound": str(config.get("bus_inbound_stop_id", "000000")),
             "outbound": str(config.get("bus_outbound_stop_id", "000000")),
@@ -187,6 +205,7 @@ class TranslinkBusClient:
                 for row in _csv_rows(archive, "routes.txt"):
                     if row.get("route_short_name", "").strip() in self.route_short_names:
                         route_ids.add(row["route_id"])
+                        self.route_short_names_by_id[row["route_id"]] = row.get("route_short_name", "").strip()
                 if not route_ids:
                     return route_ids, trip_services, trip_routes, stop_times, calendars, exceptions
 
@@ -204,10 +223,17 @@ class TranslinkBusClient:
                 for row in _csv_rows(archive, "stop_times.txt"):
                     trip_id = row.get("trip_id", "")
                     stop_id = row.get("stop_id", "")
-                    if trip_id not in trip_services or stop_id not in needed_stops:
+                    if trip_id not in trip_services:
                         continue
                     raw_time = row.get("arrival_time") or row.get("departure_time")
                     if not raw_time:
+                        continue
+                    sequence = int(row.get("stop_sequence", "0"))
+                    previous_start = self.trip_start_times.get(trip_id)
+                    if previous_start is None or sequence < previous_start[0]:
+                        departure_time = row.get("departure_time") or raw_time
+                        self.trip_start_times[trip_id] = (sequence, _parse_gtfs_time(departure_time))
+                    if stop_id not in needed_stops:
                         continue
                     stop_times.append(
                         ScheduledStopTime(
@@ -215,7 +241,7 @@ class TranslinkBusClient:
                             route=route_short_names_by_id[trip_routes[trip_id]],
                             service_id=trip_services[trip_id],
                             stop_id=stop_id,
-                            stop_sequence=int(row.get("stop_sequence", "0")),
+                            stop_sequence=sequence,
                             seconds_after_midnight=_parse_gtfs_time(raw_time),
                         )
                     )
@@ -260,7 +286,9 @@ class TranslinkBusClient:
         results.sort(key=lambda value: value[0])
         return results
 
-    def _read_trip_updates(self, stop_id: str) -> tuple[dict[str, datetime], set[str], bool]:
+    def _read_trip_updates(
+        self, stop_id: str
+    ) -> tuple[dict[str, datetime], set[str], bool, dict[str, list[RealtimeStopPrediction]]]:
         try:
             from google.transit import gtfs_realtime_pb2
         except ImportError as exc:
@@ -279,15 +307,111 @@ class TranslinkBusClient:
         now_utc = datetime.now(timezone.utc)
         header_time = datetime.fromtimestamp(feed.header.timestamp, timezone.utc) if feed.header.timestamp else now_utc
         max_age = int(self.config.get("max_realtime_age_seconds", 180))
-        feed_is_fresh = (now_utc - header_time).total_seconds() <= max_age
+        feed_age_seconds = (now_utc - header_time).total_seconds()
+        feed_is_fresh = 0 <= feed_age_seconds <= max_age
         predictions: dict[str, datetime] = {}
+        direct_stop_predictions: dict[str, list[RealtimeStopPrediction]] = {
+            route: [] for route in self.route_short_names
+        }
         canceled: set[str] = set()
+        route_coverage: dict[str, dict] = {
+            route: {"trip_updates": 0, "static_trip_matches": 0, "stop_updates": 0,
+                    "predictions": 0, "stop_ids": set(), "configured_stop_updates": 0,
+                    "configured_stop_predictions": 0}
+            for route in self.route_short_names
+        }
+        unknown_trip_ids_by_route: dict[str, int] = {route: 0 for route in self.route_short_names}
+        total_trip_updates = 0
+        unmatched_configured_routes = 0
+        raw_route_id_counts: Counter[str] = Counter()
+        descriptor_samples: list[str] = []
+        static_trip_id_matches = 0
         for entity in feed.entity:
             if not entity.HasField("trip_update"):
                 continue
+            total_trip_updates += 1
             update = entity.trip_update
             trip = update.trip
             trip_id = trip.trip_id
+            raw_route_id_counts[trip.route_id or "<blank>"] += 1
+            route_id = trip.route_id or self.trip_routes.get(trip_id, "")
+            route_name = self.route_short_names_by_id.get(route_id)
+            if route_name is None and route_id in route_coverage:
+                # Some feeds identify the passenger-facing route number here
+                # instead of the internal GTFS routes.txt route_id.
+                route_name = route_id
+            if route_name is None:
+                # Translink's live feed may use a newer internal route variant
+                # than the cached static GTFS. Keep the variant prefixes configurable.
+                route_name = next(
+                    (route for route, prefixes in self.realtime_route_id_prefixes.items()
+                     if any(route_id.startswith(prefix) for prefix in prefixes)),
+                    None,
+                )
+            if trip_id in self.trip_services:
+                static_trip_id_matches += 1
+            elif len(descriptor_samples) < 8:
+                descriptor_samples.append(
+                    f"route_id={trip.route_id or '<blank>'}, trip_id={trip_id or '<blank>'}, "
+                    f"start_date={trip.start_date or '<blank>'}, start_time={trip.start_time or '<blank>'}"
+                )
+            if route_name in route_coverage:
+                coverage = route_coverage[route_name]
+                coverage["trip_updates"] += 1
+                if trip_id in self.trip_services:
+                    coverage["static_trip_matches"] += 1
+                else:
+                    unknown_trip_ids_by_route[route_name] += 1
+                for stop_update in update.stop_time_update:
+                    has_prediction = False
+                    for event_name in ("arrival", "departure"):
+                        if not stop_update.HasField(event_name):
+                            continue
+                        event_candidate = getattr(stop_update, event_name)
+                        if event_candidate.HasField("time") or event_candidate.HasField("delay"):
+                            has_prediction = True
+                    if has_prediction:
+                        coverage["predictions"] += 1
+                    if stop_update.stop_id:
+                        coverage["stop_updates"] += 1
+                        coverage["stop_ids"].add(stop_update.stop_id)
+                        if stop_update.stop_id == stop_id:
+                            coverage["configured_stop_updates"] += 1
+                            if has_prediction:
+                                coverage["configured_stop_predictions"] += 1
+            else:
+                unmatched_configured_routes += 1
+
+            # Use absolute predictions for the configured stop even when the
+            # live schedule version has different internal trip/route IDs.
+            # The route number plus exact GTFS stop ID still scopes the result.
+            if route_name in direct_stop_predictions and trip.schedule_relationship != gtfs_realtime_pb2.TripDescriptor.CANCELED:
+                for stop_update in update.stop_time_update:
+                    if stop_update.stop_id != stop_id:
+                        continue
+                    if stop_update.schedule_relationship == gtfs_realtime_pb2.TripUpdate.StopTimeUpdate.SKIPPED:
+                        continue
+                    if stop_update.schedule_relationship == gtfs_realtime_pb2.TripUpdate.StopTimeUpdate.NO_DATA:
+                        continue
+                    event = stop_update.arrival if stop_update.HasField("arrival") else None
+                    if event is None and stop_update.HasField("departure"):
+                        event = stop_update.departure
+                    if event is None:
+                        continue
+                    event_time = (
+                        datetime.fromtimestamp(event.time, self.timezone)
+                        if event.HasField("time") else None
+                    )
+                    delay_seconds = event.delay if event.HasField("delay") else None
+                    if event_time is None and delay_seconds is None:
+                        continue
+                    direct_stop_predictions[route_name].append(
+                        RealtimeStopPrediction(
+                            route_name, trip_id, event_time, delay_seconds,
+                            trip.start_date if trip.HasField("start_date") else "",
+                            trip.start_time if trip.HasField("start_time") else "",
+                        )
+                    )
             if not trip_id or trip_id not in self.trip_services:
                 continue
             if trip.route_id and trip.route_id not in self.route_ids and trip.route_id != self.route_short_name:
@@ -318,10 +442,42 @@ class TranslinkBusClient:
                 else:
                     continue
                 predictions[trip_id] = prediction
+        route_summaries = []
+        for route_name, coverage in route_coverage.items():
+            route_summaries.append(
+                f"{route_name}: trip_updates={coverage['trip_updates']}, "
+                f"static_trip_matches={coverage['static_trip_matches']}, "
+                f"unknown_trip_ids={unknown_trip_ids_by_route[route_name]}, "
+                f"stop_updates={coverage['stop_updates']}, "
+                f"prediction_records={coverage['predictions']}, "
+                f"unique_stop_ids={len(coverage['stop_ids'])}, "
+                f"sample_stop_ids={','.join(sorted(coverage['stop_ids'])[:8]) or 'none'}, "
+                f"configured_stop_updates={coverage['configured_stop_updates']}, "
+                f"configured_stop_predictions={coverage['configured_stop_predictions']}"
+            )
+        LOG.debug(
+            "Realtime route coverage across all stop IDs: trip_updates_total=%d, "
+            "not_matched_to_configured_routes=%d, static_trip_id_matches=%d, "
+            "feed_route_ids=%s, sample_descriptors=[%s]; %s",
+            total_trip_updates, unmatched_configured_routes, static_trip_id_matches,
+            ",".join(f"{route_id}:{count}" for route_id, count in raw_route_id_counts.most_common(8)),
+            "; ".join(descriptor_samples), "; ".join(route_summaries),
+        )
+        LOG.debug(
+            "Translink TripUpdates feed: header=%s age=%.0fs max_age=%ss fresh=%s; "
+            "%d static-trip predictions, %d route/stop records, %d cancellations for stop %s",
+            header_time.astimezone(self.timezone).isoformat(), feed_age_seconds,
+            max_age, feed_is_fresh, len(predictions),
+            sum(len(items) for items in direct_stop_predictions.values()), len(canceled), stop_id,
+        )
         if not feed_is_fresh:
             # A stale cancellation is no more trustworthy than a stale arrival estimate.
-            return {}, set(), False
-        return predictions, canceled, feed_is_fresh
+            LOG.warning(
+                "TripUpdates feed is stale or has a future timestamp; ignoring its predictions "
+                "and cancellations and falling back to the static timetable"
+            )
+            return {}, set(), False, {route: [] for route in self.route_short_names}
+        return predictions, canceled, feed_is_fresh, direct_stop_predictions
 
     def _scheduled_event(self, item: ScheduledStopTime, start_date: str = "") -> datetime:
         if len(start_date) == 8:
@@ -331,6 +487,39 @@ class TranslinkBusClient:
         return datetime.combine(service_date, day_time.min, self.timezone) + timedelta(
             seconds=item.seconds_after_midnight
         )
+
+    def _match_realtime_departure(
+        self,
+        prediction: RealtimeStopPrediction,
+        departures: list[tuple[datetime, ScheduledStopTime]],
+    ) -> tuple[datetime, ScheduledStopTime] | None:
+        """Link a live trip to a unique cached departure by route and GTFS start time."""
+        if prediction.trip_id in self.trip_services:
+            direct_match = next(
+                ((when, item) for when, item in departures if item.trip_id == prediction.trip_id),
+                None,
+            )
+            if direct_match:
+                return direct_match
+        if not prediction.start_time:
+            return None
+        try:
+            start_seconds = _parse_gtfs_time(prediction.start_time)
+        except ValueError:
+            return None
+        matches = [
+            (when, item)
+            for when, item in departures
+            if item.route == prediction.route
+            and self.trip_start_times.get(item.trip_id, (-1, -1))[1] == start_seconds
+            and (not prediction.start_date or when.strftime("%Y%m%d") == prediction.start_date)
+        ]
+        scheduled_times = {when for when, _ in matches}
+        if len(scheduled_times) != 1:
+            return None
+        scheduled_time = next(iter(scheduled_times))
+        matched_item = next(item for when, item in matches if when == scheduled_time)
+        return scheduled_time, matched_item
 
     def next_arrivals(self, now: datetime | None = None) -> list[BusArrival]:
         """Return the next scheduled or realtime arrival for each configured route."""
@@ -347,34 +536,101 @@ class TranslinkBusClient:
         }
         departures = self._scheduled_departures(stop_id, local_now)
         try:
-            predictions, canceled, feed_is_fresh = self._read_trip_updates(stop_id) if departures else ({}, set(), False)
+            predictions, canceled, feed_is_fresh, direct_stop_predictions = self._read_trip_updates(stop_id)
         except BusDataError as exc:
             LOG.warning("Realtime bus prediction unavailable; using timetable: %s", exc)
             predictions, canceled, feed_is_fresh = {}, set(), False
+            direct_stop_predictions = {route: [] for route in self.route_short_names}
 
-        candidates: dict[str, list[tuple[datetime, str]]] = {
+        candidates: dict[str, list[tuple[datetime, str, datetime | None, datetime | None, str, str | None]]] = {
             route: [] for route in self.route_short_names
         }
         for scheduled_event, item in departures:
             if item.trip_id in canceled:
+                LOG.debug(
+                    "Ignoring canceled scheduled trip %s on route %s according to fresh GTFS-Realtime data",
+                    item.trip_id, item.route,
+                )
                 continue
             predicted = predictions.get(item.trip_id) if feed_is_fresh else None
+            fallback_reason = None
             # Avoid applying a prediction for today's trip to the same recurring
             # GTFS trip ID on a later service day.
             if predicted is not None and abs((predicted - scheduled_event).total_seconds()) > 3 * 3600:
+                fallback_reason = "API estimate differs from this scheduled service date by more than 3 hours"
                 predicted = None
+            elif predicted is None:
+                fallback_reason = (
+                    "TripUpdates feed unavailable or stale"
+                    if not feed_is_fresh
+                    else "no stop-level API estimate matched this trip"
+                )
             event_time = predicted or scheduled_event
             if event_time <= local_now - timedelta(minutes=1):
                 continue
             source = "realtime" if predicted is not None else "scheduled"
-            candidates[item.route].append((event_time, source))
+            candidates[item.route].append(
+                (event_time, source, scheduled_event, predicted, item.trip_id, fallback_reason)
+            )
+
+        if feed_is_fresh:
+            for route, stop_predictions in direct_stop_predictions.items():
+                for stop_prediction in stop_predictions:
+                    matched_departure = self._match_realtime_departure(stop_prediction, departures)
+                    predicted_time = stop_prediction.arrival
+                    if predicted_time is None and stop_prediction.delay_seconds is not None and matched_departure:
+                        predicted_time = matched_departure[0] + timedelta(seconds=stop_prediction.delay_seconds)
+                    if predicted_time is None:
+                        LOG.debug(
+                            "Ignoring delay-only API record route=%s trip=%s stop=%s: "
+                            "no unique static departure matched its start time",
+                            route, stop_prediction.trip_id, stop_id,
+                        )
+                        continue
+                    if predicted_time <= local_now - timedelta(minutes=1):
+                        continue
+                    if predicted_time > local_now + timedelta(hours=3):
+                        LOG.warning(
+                            "Ignoring implausibly distant API estimate route=%s trip=%s stop=%s: %s",
+                            route, stop_prediction.trip_id, stop_id, predicted_time.isoformat(),
+                        )
+                        continue
+                    scheduled_time = matched_departure[0] if matched_departure else None
+                    if scheduled_time and abs((predicted_time - scheduled_time).total_seconds()) > 3 * 3600:
+                        LOG.warning(
+                            "Ignoring API estimate route=%s trip=%s because it differs from its "
+                            "matched timetable departure by more than 3 hours",
+                            route, stop_prediction.trip_id,
+                        )
+                        continue
+                    if matched_departure:
+                        matched_static_time = matched_departure[0]
+                        candidates[route] = [
+                            candidate for candidate in candidates[route]
+                            if candidate[2] != matched_static_time
+                        ]
+                    candidates[route].append((
+                        predicted_time, "realtime", scheduled_time, predicted_time,
+                        stop_prediction.trip_id, None,
+                    ))
 
         arrivals = []
         for route in self.route_short_names:
             route_candidates = candidates.get(route, [])
             if not route_candidates:
                 continue
-            arrival, source = min(route_candidates, key=lambda item: item[0])
+            arrival, source, scheduled_event, predicted, trip_id, fallback_reason = min(
+                route_candidates, key=lambda item: item[0]
+            )
+            LOG.debug(
+                "Bus estimate route=%s trip=%s stop=%s: scheduled=%s; API=%s; selected=%s; "
+                "source=%s%s",
+                route, trip_id, stop_id,
+                scheduled_event.isoformat() if scheduled_event else "unmatched live trip",
+                predicted.isoformat() if predicted else "unavailable",
+                arrival.isoformat(), source,
+                f"; fallback reason={fallback_reason}" if fallback_reason else "",
+            )
             route_destination = destinations.get(route, self.destinations)[direction]
             arrivals.append(
                 BusArrival(route, direction, route_destination, public_stop_code, arrival, source)
@@ -382,6 +638,17 @@ class TranslinkBusClient:
         if arrivals:
             return arrivals
 
+        if departures:
+            LOG.warning(
+                "No upcoming bus arrivals remain for routes %s at stop %s (%s) after applying "
+                "cancellations and current-time filtering",
+                ", ".join(self.route_short_names), stop_id, public_stop_code,
+            )
+        else:
+            LOG.warning(
+                "No upcoming static timetable entries were found for routes %s at stop %s (%s)",
+                ", ".join(self.route_short_names), stop_id, public_stop_code,
+            )
         return [
             BusArrival(
                 self.route_short_name,

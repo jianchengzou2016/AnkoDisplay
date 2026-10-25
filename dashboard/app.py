@@ -50,6 +50,17 @@ def load_config(path: Path) -> dict:
     routes = config.get("bus_routes", [config.get("bus_route", "150")])
     if not isinstance(routes, list) or not routes or any(not str(route).isdigit() for route in routes):
         raise ValueError("bus_routes must be a non-empty list of route numbers")
+    log_level = str(config.get("log_level", "INFO")).upper()
+    if log_level not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
+        raise ValueError("log_level must be DEBUG, INFO, WARNING, ERROR, or CRITICAL")
+    route_prefixes = config.get("realtime_route_id_prefixes", {})
+    if not isinstance(route_prefixes, dict):
+        raise ValueError("realtime_route_id_prefixes must be an object keyed by passenger route number")
+    for route, prefixes in route_prefixes.items():
+        if not str(route).isdigit() or not isinstance(prefixes, list) or not prefixes or any(
+            not isinstance(prefix, str) or not prefix for prefix in prefixes
+        ):
+            raise ValueError("realtime_route_id_prefixes values must be non-empty lists of route ID prefixes")
     if int(config.get("bus_alternate_window_minutes", 60)) < 1:
         raise ValueError("bus_alternate_window_minutes must be at least 1")
     active_hours = config.get("active_hours", {"enabled": False})
@@ -140,8 +151,8 @@ def set_display_screen(config: dict, state: str) -> None:
     subprocess.run(command, cwd=client_dir, check=True)
 
 
-def fetch_weather_condition(config: dict) -> str:
-    latitude, longitude, place = geocode(config["location"], config["country_code"])
+def fetch_weather_condition(config: dict, location: tuple[float, float, str] | None = None) -> str:
+    latitude, longitude, place = location or geocode(config["location"], config["country_code"])
     forecast = fetch_forecast(
         latitude, longitude,
         timezone=config.get("timezone", "auto"),
@@ -216,6 +227,7 @@ def main() -> int:
     args = parse_args()
     try:
         config = load_config(args.config)
+        logging.getLogger().setLevel(getattr(logging, config.get("log_level", "INFO").upper()))
         schedule_enabled = bool(config.get("active_hours", {}).get("enabled", False))
         if args.sample:
             path = _weather_image(args.sample)
@@ -236,6 +248,7 @@ def main() -> int:
         last_bus_signature: tuple | None = None
         active_bus_route: str | None = None
         last_weather_condition: str | None = None
+        weather_location: tuple[float, float, str] | None = None
         displayed_signature: tuple | None = None
         last_upload_attempt = 0.0
         started = time.monotonic()
@@ -313,7 +326,9 @@ def main() -> int:
 
             if now >= next_weather_update:
                 try:
-                    condition = fetch_weather_condition(config)
+                    if weather_location is None:
+                        weather_location = geocode(config["location"], config["country_code"])
+                    condition = fetch_weather_condition(config, weather_location)
                     if condition != last_weather_condition or last_weather_image is None:
                         last_weather_image = _weather_image(condition)
                     last_weather_condition = condition
