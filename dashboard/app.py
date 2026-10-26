@@ -47,6 +47,8 @@ def load_config(path: Path) -> dict:
     for key in ("bus_inbound_stop_id", "bus_outbound_stop_id"):
         if not str(config.get(key, "")).isdigit():
             raise ValueError(f"{key} must contain a numeric Translink stop ID")
+    if int(config.get("bus_second_arrival_window_minutes", 20)) < 1:
+        raise ValueError("bus_second_arrival_window_minutes must be at least 1")
     routes = config.get("bus_routes", [config.get("bus_route", "150")])
     if not isinstance(routes, list) or not routes or any(not str(route).isdigit() for route in routes):
         raise ValueError("bus_routes must be a non-empty list of route numbers")
@@ -177,13 +179,22 @@ def _bus_image(arrival: BusArrival) -> Path:
     path = ROOT / "output" / "bus_status.png"
     render_bus_status(arrival, path)
     eta = arrival.eta_minutes
+    second_eta = arrival.second_eta_minutes
     eta_text = "no service found" if eta is None else f"{eta} min"
-    LOG.info("Bus %s %s: %s (%s)", arrival.route, arrival.direction, eta_text, arrival.source)
+    if second_eta is not None:
+        eta_text += f", following {second_eta} min"
+    source_text = arrival.source
+    if arrival.second_source and arrival.second_source != arrival.source:
+        source_text += f"/{arrival.second_source}"
+    LOG.info("Bus %s %s: %s (%s)", arrival.route, arrival.direction, eta_text, source_text)
     return path
 
 
 def _arrival_signature(arrival: BusArrival) -> tuple:
-    return arrival.route, arrival.direction, arrival.eta_minutes, arrival.source
+    return (
+        arrival.route, arrival.direction, arrival.eta_minutes,
+        arrival.second_eta_minutes, arrival.source, arrival.second_source,
+    )
 
 
 def _upload_content_description(signature: tuple) -> str:
@@ -194,7 +205,7 @@ def _upload_content_description(signature: tuple) -> str:
     if page_data is None:
         return "bus page content=unavailable; source=unknown"
 
-    route, direction, eta, source = page_data
+    route, direction, eta, second_eta, source, second_source = page_data
     destination_marker = "C" if direction == "inbound" else "B"
     eta_text = "--m" if eta is None else ("99+m" if eta >= 100 else f"{eta}m")
     source_description = {
@@ -202,6 +213,10 @@ def _upload_content_description(signature: tuple) -> str:
         "scheduled": "Translink GTFS timetable",
         "unknown": "unknown/no arrival data",
     }.get(source, str(source))
+    if second_eta is not None:
+        eta_text += f"/{second_eta}m"
+        if second_source and second_source != source:
+            source_description += f" + following {second_source}"
     return (
         f"bus page content={route} {destination_marker} {eta_text}; "
         f"source={source_description}"

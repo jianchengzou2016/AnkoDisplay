@@ -18,6 +18,7 @@
   "bus_timezone": "Australia/Brisbane",
   "bus_refresh_seconds": 60,
   "bus_alternate_window_minutes": 60,
+  "bus_second_arrival_window_minutes": 20,
   "weather_refresh_seconds": 300,
   "page_cycle_seconds": 300,
   "weather_page_seconds": 10,

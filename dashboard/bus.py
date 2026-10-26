@@ -47,12 +47,21 @@ class BusArrival:
     stop_id: str
     arrival: datetime | None
     source: str
+    second_arrival: datetime | None = None
+    second_source: str | None = None
 
     @property
     def eta_minutes(self) -> int | None:
         if self.arrival is None:
             return None
         seconds = (self.arrival - datetime.now(TRANSIT_TZ)).total_seconds()
+        return max(0, int((seconds + 59) // 60))
+
+    @property
+    def second_eta_minutes(self) -> int | None:
+        if self.second_arrival is None:
+            return None
+        seconds = (self.second_arrival - datetime.now(TRANSIT_TZ)).total_seconds()
         return max(0, int((seconds + 59) // 60))
 
 
@@ -522,7 +531,7 @@ class TranslinkBusClient:
         return scheduled_time, matched_item
 
     def next_arrivals(self, now: datetime | None = None) -> list[BusArrival]:
-        """Return the next scheduled or realtime arrival for each configured route."""
+        """Return each route's next arrival and a near-term following arrival, if any."""
         local_now = (now or datetime.now(self.timezone)).astimezone(self.timezone)
         direction = "inbound" if local_now.hour < int(self.config.get("bus_noon_switch_hour", 12)) else "outbound"
         public_stop_code = self.stop_ids[direction]
@@ -614,13 +623,31 @@ class TranslinkBusClient:
                         stop_prediction.trip_id, None,
                     ))
 
+        second_arrival_window = int(self.config.get("bus_second_arrival_window_minutes", 20))
         arrivals = []
         for route in self.route_short_names:
             route_candidates = candidates.get(route, [])
             if not route_candidates:
                 continue
-            arrival, source, scheduled_event, predicted, trip_id, fallback_reason = min(
-                route_candidates, key=lambda item: item[0]
+            route_candidates.sort(key=lambda item: item[0])
+            # A realtime event can coexist with its static fallback when the
+            # feed's trip descriptor cannot be linked to the cached schedule.
+            # Keep only one candidate per exact arrival time for display.
+            unique_candidates = []
+            seen_arrivals = set()
+            for candidate in route_candidates:
+                if candidate[0] in seen_arrivals:
+                    continue
+                seen_arrivals.add(candidate[0])
+                unique_candidates.append(candidate)
+
+            arrival, source, scheduled_event, predicted, trip_id, fallback_reason = unique_candidates[0]
+            following = next(
+                (
+                    candidate for candidate in unique_candidates[1:]
+                    if candidate[0] <= local_now + timedelta(minutes=second_arrival_window)
+                ),
+                None,
             )
             LOG.debug(
                 "Bus estimate route=%s trip=%s stop=%s: scheduled=%s; API=%s; selected=%s; "
@@ -631,9 +658,18 @@ class TranslinkBusClient:
                 arrival.isoformat(), source,
                 f"; fallback reason={fallback_reason}" if fallback_reason else "",
             )
+            if following:
+                LOG.debug(
+                    "Following bus route=%s trip=%s: arrival=%s; source=%s",
+                    route, following[4], following[0].isoformat(), following[1],
+                )
             route_destination = destinations.get(route, self.destinations)[direction]
             arrivals.append(
-                BusArrival(route, direction, route_destination, public_stop_code, arrival, source)
+                BusArrival(
+                    route, direction, route_destination, public_stop_code, arrival, source,
+                    following[0] if following else None,
+                    following[1] if following else None,
+                )
             )
         if arrivals:
             return arrivals
@@ -671,7 +707,8 @@ class TranslinkBusClient:
 
 
 def sample_arrival(
-    direction: str = "inbound", eta_minutes: int = 8, source: str = "realtime", route: str = "150"
+    direction: str = "inbound", eta_minutes: int = 8, source: str = "realtime", route: str = "150",
+    second_eta_minutes: int | None = 18,
 ) -> BusArrival:
     """Create predictable offline data for trying the bus renderer."""
     if direction not in {"inbound", "outbound"}:
@@ -684,4 +721,9 @@ def sample_arrival(
         stop_id="000000",
         arrival=now + timedelta(minutes=eta_minutes),
         source=source,
+        second_arrival=(
+            now + timedelta(minutes=second_eta_minutes)
+            if second_eta_minutes is not None else None
+        ),
+        second_source=source if second_eta_minutes is not None else None,
     )

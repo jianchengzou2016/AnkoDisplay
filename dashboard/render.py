@@ -25,6 +25,7 @@ FONT_3X5 = {
     "9": ("111", "101", "111", "001", "111"),
     "-": ("000", "000", "111", "000", "000"),
     "+": ("000", "010", "111", "010", "000"),
+    "/": ("001", "001", "010", "100", "100"),
     # A 5-pixel-wide lowercase m keeps its two arches distinct from an n.
     "m": ("00000", "11111", "10101", "10101", "10101"),
     "C": ("111", "100", "100", "100", "111"),
@@ -88,7 +89,7 @@ def render_icon(condition: str, output_path: Path) -> Path:
 
 
 def render_bus_status(arrival: BusArrival, output_path: Path) -> Path:
-    """Draw the next route 150 arrival using a compact, legible 16x16 layout."""
+    """Draw a route's next arrival and optional near-term following arrival."""
     image = Image.new("RGB", SIZE, BLACK)
     draw = ImageDraw.Draw(image)
     route_color = (255, 220, 50)
@@ -108,18 +109,38 @@ def render_bus_status(arrival: BusArrival, output_path: Path) -> Path:
     draw.point((15, 5), fill=status_color)
 
     eta = arrival.eta_minutes
+    second_eta = arrival.second_eta_minutes
     gap = 1
     if eta is None:
         value = "--m"
+        width = _text_width(value, gap=gap)
+        _draw_3x5(draw, value, max(0, (16 - width) // 2), 9, eta_color, gap=gap)
+    elif second_eta is not None:
+        # The two compact values mean minutes to the next and following buses.
+        # At the configured <=20 minute threshold, two two-digit ETAs plus '/'
+        # fit in 15 pixels with the 3x5 font and no gaps.
+        first = str(eta)
+        following = str(second_eta)
+        first_width = _text_width(first, gap=0)
+        separator_width = _text_width("/", gap=0)
+        following_width = _text_width(following, gap=0)
+        cursor = max(0, (16 - first_width - separator_width - following_width) // 2)
+        _draw_3x5(draw, first, cursor, 9, eta_color, gap=0)
+        cursor += first_width
+        _draw_3x5(draw, "/", cursor, 9, (120, 120, 120), gap=0)
+        cursor += separator_width
+        _draw_3x5(draw, following, cursor, 9, (70, 190, 255), gap=0)
     elif eta >= 100:
         # Four compact glyphs fit at 14 pixels when touching: 99+m means
         # the ETA is at least 100 minutes, without suggesting it is exactly 99.
         value = "99+m"
         gap = 0
+        width = _text_width(value, gap=gap)
+        _draw_3x5(draw, value, max(0, (16 - width) // 2), 9, eta_color, gap=gap)
     else:
         value = f"{eta}m"
-    width = _text_width(value, gap=gap)
-    _draw_3x5(draw, value, max(0, (16 - width) // 2), 9, eta_color, gap=gap)
+        width = _text_width(value, gap=gap)
+        _draw_3x5(draw, value, max(0, (16 - width) // 2), 9, eta_color, gap=gap)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     image.save(output_path, format="PNG", optimize=True)

@@ -1,5 +1,6 @@
 # Local configuration contains device-specific details.
 /dashboard/config.json
+/dashboard/transport_poc/config.json
 
 # Downloaded data and generated display previews.
 /dashboard/cache/
